@@ -67,6 +67,7 @@ func AutoDetect() Result {
 	detectPi(&result)
 	detectQwenCLI(&result)
 	detectMuseCode(&result)
+	detectDsh(&result)
 
 	// Phase 2: process env vars. Most authoritative; runs before any
 	// file-based credential adoption so a freshly-set env var always
