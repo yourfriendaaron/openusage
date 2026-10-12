@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -547,6 +548,9 @@ func (s *Store) ingestInTx(ctx context.Context, ex *ingestExec, req IngestReques
 		if enrichErr := enrichEventByDedupKey(ctx, ex, dedupKey, norm); enrichErr != nil {
 			return IngestResult{}, fmt.Errorf("telemetry: enrich dedup event: %w", enrichErr)
 		}
+		if enrichErr := enrichRawPayload(ctx, ex, existing.RawEventID, payloadBytes); enrichErr != nil {
+			return IngestResult{}, fmt.Errorf("telemetry: enrich dedup payload: %w", enrichErr)
+		}
 		return IngestResult{
 			Status:     "accepted",
 			Deduped:    true,
@@ -609,6 +613,9 @@ func (s *Store) ingestInTx(ctx context.Context, ex *ingestExec, req IngestReques
 			}
 			if enrichErr := enrichEventByDedupKey(ctx, ex, dedupKey, norm); enrichErr != nil {
 				return IngestResult{}, fmt.Errorf("telemetry: enrich dedup event: %w", enrichErr)
+			}
+			if enrichErr := enrichRawPayload(ctx, ex, existing.RawEventID, payloadBytes); enrichErr != nil {
+				return IngestResult{}, fmt.Errorf("telemetry: enrich dedup payload: %w", enrichErr)
 			}
 			return IngestResult{
 				Status:     "accepted",
@@ -752,6 +759,61 @@ func loadCanonicalEventByDedupKey(ctx context.Context, ex *ingestExec, dedupKey 
 		&row.SourceChannel,
 	)
 	return row, err
+}
+
+// enrichRawPayload adds to a stored event's payload the top-level keys a
+// duplicate carries that the stored copy lacks. Stored values are never
+// replaced, and a payload cleared by retention stays cleared. This is what
+// lets a collector that starts reporting a new field (for example line counts
+// on tool calls) fill it in for events ingested before it did.
+func enrichRawPayload(ctx context.Context, ex *ingestExec, rawEventID string, incoming []byte) error {
+	if strings.TrimSpace(rawEventID) == "" || len(incoming) == 0 {
+		return nil
+	}
+	incomingHash := sha256.Sum256(incoming)
+	var stored, storedHash string
+	row, err := ex.queryRow(ctx,
+		`SELECT source_payload, source_payload_hash FROM usage_raw_events WHERE raw_event_id = ?`,
+		rawEventID,
+	)
+	if err != nil {
+		return err
+	}
+	err = row.Scan(&stored, &storedHash)
+	if err == sql.ErrNoRows {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if storedHash == hex.EncodeToString(incomingHash[:]) || strings.TrimSpace(stored) == "{}" {
+		return nil
+	}
+
+	var have, want map[string]json.RawMessage
+	if json.Unmarshal([]byte(stored), &have) != nil || json.Unmarshal(incoming, &want) != nil || have == nil {
+		return nil
+	}
+	added := false
+	for key, value := range want {
+		if _, ok := have[key]; !ok {
+			have[key] = value
+			added = true
+		}
+	}
+	if !added {
+		return nil
+	}
+	merged, err := json.Marshal(have)
+	if err != nil {
+		return err
+	}
+	mergedHash := sha256.Sum256(merged)
+	_, err = ex.exec(ctx,
+		`UPDATE usage_raw_events SET source_payload = ?, source_payload_hash = ? WHERE raw_event_id = ?`,
+		string(merged), hex.EncodeToString(mergedHash[:]), rawEventID,
+	)
+	return err
 }
 
 // enrichEventByDedupKey merges duplicate canonical fields with source priority.
