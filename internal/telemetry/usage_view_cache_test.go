@@ -245,3 +245,34 @@ func TestLoadUsageViewCached_EmptyNamespaceDisablesCache(t *testing.T) {
 		t.Fatalf("empty namespace should return nil agg, got %+v", agg)
 	}
 }
+
+// TestUsageViewCacheStore_NewDaySupersedesOldEntry verifies that when the
+// today cutoff moves, the entry for the previous day is dropped rather than
+// kept alongside the new one until the FIFO cap.
+func TestUsageViewCacheStore_NewDaySupersedesOldEntry(t *testing.T) {
+	globalUsageViewCache.reset()
+	t.Cleanup(globalUsageViewCache.reset)
+	namespace := usageViewCacheNamespace("day-rollover")
+	base := usageFilter{ProviderIDs: []string{"claude_code"}, WindowKey: core.TimeWindow30d}
+	other := usageFilter{ProviderIDs: []string{"codex"}, WindowKey: core.TimeWindow30d}
+
+	day := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
+	var lastKey string
+	for i := range 5 {
+		f := base
+		f.TodaySince = day.AddDate(0, 0, i)
+		lastKey = usageViewCacheKey(namespace, f)
+		globalUsageViewCache.store(lastKey, &usageViewCacheEntry{})
+	}
+	globalUsageViewCache.store(usageViewCacheKey(namespace, other), &usageViewCacheEntry{})
+
+	if got := len(globalUsageViewCache.entries); got != 2 {
+		t.Fatalf("entries = %d, want 2 (one per scope)", got)
+	}
+	if got := len(globalUsageViewCache.order); got != 2 {
+		t.Fatalf("order = %d, want 2", got)
+	}
+	if _, ok := globalUsageViewCache.lookup(lastKey); !ok {
+		t.Fatal("latest day's entry must stay cached")
+	}
+}

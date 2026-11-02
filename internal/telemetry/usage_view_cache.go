@@ -43,10 +43,16 @@ type usageViewCacheStore struct {
 	// order tracks insertion order for FIFO eviction; we keep it cheap and
 	// simple rather than building a full LRU.
 	order []string
+	// scopes maps a key's scope (everything but its since/today cutoffs) to
+	// the one key currently stored for it. A new day or a moved cutoff
+	// supersedes the old entry, so store drops it instead of keeping one
+	// full incremental state per day until the FIFO cap is reached.
+	scopes map[string]string
 }
 
 var globalUsageViewCache = &usageViewCacheStore{
 	entries: make(map[string]*usageViewCacheEntry),
+	scopes:  make(map[string]string),
 }
 
 // usageViewCacheNamespace identifies the database backing a cache entry. It
@@ -75,18 +81,49 @@ func (s *usageViewCacheStore) lookup(key string) (*usageViewCacheEntry, bool) {
 	return entry, ok
 }
 
+// usageViewCacheScope strips the trailing since and today cutoffs from a
+// cache key, leaving the namespace, providers, account and window it covers.
+func usageViewCacheScope(key string) string {
+	scope := key
+	for range 2 {
+		if i := strings.LastIndexByte(scope, '|'); i >= 0 {
+			scope = scope[:i]
+		}
+	}
+	return scope
+}
+
 func (s *usageViewCacheStore) store(key string, entry *usageViewCacheEntry) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.scopes == nil {
+		s.scopes = make(map[string]string)
+	}
+	scope := usageViewCacheScope(key)
+	if prev, ok := s.scopes[scope]; ok && prev != key {
+		s.removeLocked(prev)
+	}
+	s.scopes[scope] = key
 	if _, exists := s.entries[key]; !exists {
 		s.order = append(s.order, key)
 		for len(s.order) > usageViewCacheMaxEntries {
-			drop := s.order[0]
-			s.order = s.order[1:]
-			delete(s.entries, drop)
+			s.removeLocked(s.order[0])
 		}
 	}
 	s.entries[key] = entry
+}
+
+func (s *usageViewCacheStore) removeLocked(key string) {
+	delete(s.entries, key)
+	if scope := usageViewCacheScope(key); s.scopes[scope] == key {
+		delete(s.scopes, scope)
+	}
+	for i, k := range s.order {
+		if k == key {
+			s.order = append(s.order[:i], s.order[i+1:]...)
+			break
+		}
+	}
 }
 
 // reset is exposed for tests so they can run against a clean cache.
@@ -95,6 +132,7 @@ func (s *usageViewCacheStore) reset() {
 	defer s.mu.Unlock()
 	s.entries = make(map[string]*usageViewCacheEntry)
 	s.order = nil
+	s.scopes = make(map[string]string)
 }
 
 // probeUsageEventsFingerprint runs a cheap MAX(rowid) + COUNT(*) query against
